@@ -1,0 +1,301 @@
+---
+title: "R Notebook"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+# Packages to be installed
+
+```{r echo=FALSE}
+if (!require(tidyverse)){install.packages("tidyverse",dependencies = TRUE)} 
+library(tidyverse)
+
+if (!require(readr)){install.packages("readr",dependencies = TRUE)} 
+library(readr)
+
+if (!require(lubridate)){install.packages("lubridate",dependencies = TRUE)} 
+library(lubridate)
+
+if (!require(party)){install.packages("party",dependencies = TRUE)} 
+library(party)
+
+if (!require(ipred)){install.packages("ipred",dependencies = TRUE)} 
+library(ipred)
+
+if (!require(forecast)){install.packages("forecast",dependencies = TRUE)} 
+library(forecast)
+
+if (!require(zoo)){install.packages("zoo",dependencies = TRUE)} 
+library(zoo)
+
+```
+
+## Import the data from source location:
+
+```{r}
+bookings <- read_csv("C:/Users/sangeeta/Downloads/bookings.csv")
+#View(bookings)
+```
+
+## Tidy the data
+
+```{r}
+
+bookings <- bookings %>% drop_na()
+
+```
+
+
+
+
+## Feature Engineering
+
+### Parse Out Day of Week
+
+```{r}
+
+bookings$DayOfDeparture  = wday(mdy_hm(bookings$DepartureDate,locale = "English"),label = TRUE)
+```
+
+### Normalize Fare Per Person
+```{r}
+bookings$FarePP = bookings$Fare/bookings$PassengerCount
+```
+
+### Convert to FACTOR
+
+```{r}
+bookings$class = as.factor(bookings$InvClass)
+bookings$orig = as.factor(bookings$Origin)
+bookings$desti = as.factor(bookings$Destination)
+```
+
+
+## Forecasting Fares
+
+### Data Preparation
+
+```{r}
+bookings %>% group_by(orig,desti) %>% tally(sort = TRUE) #indicates DATASET has DTW-LAS as highest number of flights
+
+
+df_LAS = bookings %>% dplyr::filter(orig == 'DTW' & desti == 'LAS') %>% 
+              select(DepartureDate,FarePP) %>% 
+              filter(FarePP > 0) %>% 
+              group_by(DepartureDate) %>% 
+              summarise(FarePP = mean(FarePP))
+
+df_LAS$DepartureDate = mdy_hm(df_LAS$DepartureDate)
+df_LAS$FarePP = round(df_LAS$FarePP,digits = 2)
+
+tsdf_LAS = ts(df_LAS$FarePP, start = c(2005,1),frequency = 7) 
+# Set frequency of 7 since dataset has only 5 months of data for one year, therefore accounting for weekly seasonality only.
+
+plot(tsdf_LAS,
+     lwd=1, 
+     #xaxt= "n",
+     ylab = "Fare Price",
+     xlab = "Time (in days)",
+     main = "Mean Daily Fare Price")
+
+plot(decompose(tsdf_LAS))
+
+# Did not use zoo package since there are no arbitrary gaps in the time series
+
+```
+
+### Split Data into 3 - train, test and validation
+
+```{r}
+nValidation = 31
+nTrain = length(tsdf_LAS) - nValidation
+train.ts = window(tsdf_LAS,start = c(2005,1),end = c(2005,nTrain))
+valid.ts = window(tsdf_LAS,start = c(2005,nTrain + 1),end = c(2005,nTrain + nValidation))
+```
+
+
+Naive Forecast (Quadratic model)
+```{r}
+AlFc.lm = tslm(train.ts ~ trend + I(trend^2))
+AlFc.lm.pred = forecast(AlFc.lm,h = nValidation,level = 0)
+plot(AlFc.lm.pred)
+lines(AlFc.lm$fitted,lwd = 1)
+lines(valid.ts)
+
+accuracy(AlFc.lm.pred$mean,valid.ts)
+```
+
+
+### Smoothing Method - Moving Average
+```{r}
+ma.trailing = rollmean(tsdf_LAS,k=12,align = "right") #calculates trailing moving average
+ma.centered = ma(tsdf_LAS,order = 12) #creates a centered moving average
+plot(tsdf_LAS)
+lines(ma.centered,lwd=2)
+lines(ma.trailing,lwd=2,lty=2)
+legend(2005,c("Actual Time Series","Centered Moving Average","Trailing Moving Average"),lty = c(1,1,2),lwd = c(1,2,2), bty = "n")
+```
+
+Notice that the seasonality is not captured in the forecast. This is a clear indication that the moving average method can be used for forecasting only in series that lack seasonality and trend. An alternative approach would be to de-trend and deseasonalize the series, use the forecast, and then add trend and seasonality back into the forecast.
+
+###Trailing Moving Average forecaster
+```{r}
+nValidation = 31
+nTrain = length(tsdf_LAS)- nValidation
+train.ts = window(tsdf_LAS,start=c(2005,1),end=c(2005,nTrain))
+valid.ts = window(tsdf_LAS,start = c(2005,nTrain + 1), end=c(2005,nTrain + nValidation))
+ma.trailing = rollmean(train.ts,k=12,align="right")
+last.ma = tail(ma.trailing,1)
+ma.trailing.pred = ts(rep(last.ma,nValidation),start = c(2005,nTrain+1),end=c(2005,nTrain+nValidation),frequency = 7)
+plot(tsdf_LAS,
+     lwd=1, 
+     ylab = "Fare Price",
+     xlab = "Time (in days)",
+     main = "Trailing Moving Average (rolling window = 7)")
+lines(ma.trailing,lwd = 2, col = "blue")
+lines(ma.trailing.pred,lwd = 2, col = "red", lty = 2)
+lines(tsdf_LAS)
+```
+
+Differencing is another method applied to remove trend and seasonality from the time series. However for data driven forecasting methods such as neural networks, differencing appears to produce inferior results as seen later. 
+
+### Simple Exponential Smoothing
+
+- A weighted average of past values.
+- Use only for series that have no trend or seasonality. 
+- **ets** function in **forecast** package : error, trend, seasonality
+
+```{r}
+diff.twice.ts = diff(diff(tsdf_LAS,lag = 12), lag = 1)
+nValidation = 31
+nTrain = length(diff.twice.ts) - nValidation
+train.ts.diff = window(diff.twice.ts, start = c(2005,2), end = c(2005,nTrain+1))
+vaild.ts.diff = window(diff.twice.ts, start = c(2005,nTrain+2),end = c(2005,nTrain+1+nValidation))
+
+ses = ets(train.ts.diff,model = "ANN", alpha = 0.2)
+ses.pred = forecast(ses,h = nValidation, level = 0)
+ses.pred
+
+plot(ses.pred)
+lines(ses.pred$fitted, lwd = 2, col = "blue")
+?ets
+
+```
+
+### Performance comparison of two simple exponential smoothing models - Fixed alpha & Optimal alpha
+```{r}
+ses.opt = ets(train.ts,model = "ZAA")
+ses.opt.pred = forecast(ses.opt,h = nValidation,level = 0)
+accuracy(ses.pred,valid.ts)
+accuracy(ses.opt.pred,valid.ts)
+ses.opt
+```
+
+### Series with Trend - Double Exponential Smoothing/Holt's Linear model
+For additive trend, use option = "AMN".
+For multiplicative trend, use option = "MMN".
+
+
+## Series with Trend and Seasonality - Holt Winters Exponential Smoothing
+Use option = "MAA" (Multiplicative error, Additive trend, Additive seasonality)
+
+```{r}
+hwin = ets(train.ts,model = "MAA")
+hwin.pred = forecast(hwin,h=nValidation,level = 0)
+plot(hwin.pred,
+     lwd=1, 
+     ylab = "Fare Price",
+     xlab = "Time (in days)")
+lines(hwin.pred$fitted,lwd=2,col="blue")
+lines(valid.ts)
+accuracy(hwin.pred,valid.ts)
+```
+
+
+### Linear Trend Model
+```{r}
+train.lm = tslm(train.ts ~ trend)
+plot(train.ts)
+lines(train.lm$fitted,lwd=2)
+```
+
+```{r}
+train.lm.pred = forecast(train.lm,h=nValidation,level = 0)
+plot(train.lm.pred)
+lines(train.lm.pred$fitted,lwd=2,col="blue")
+lines(valid.ts)
+```
+
+
+### AR(1) model
+```{r}
+train.lm.trend.season = tslm(train.ts ~ trend + I(trend^2) + season)
+train.res.arima = Arima(train.lm.trend.season$residuals,order = c(1,0,0))
+train.aes.arima.pred = forecast(train.res.arima,h = nValidation)
+plot(train.lm.trend.season$residuals)
+plot(train.lm.trend.season$residuals)
+lines(train.res.arima$fitted,lwd = 2, col = "blue")
+```
+
+### Neural Networks for Forecasting
+- Can be used to generate numerical and binary forecasts
+- Highly data-driven and computationally expensive
+- **BLACK BOX**
+- Supermacy of their accuracy in comparison to other methods is a hit or miss
+- Input layer, Hidden layer, Output layer
+- Hidden layer is a weighted sum of the inputs to which an activation function is applied
+- External information is the secret sauce rather than its forecasting prowess
+  - Law and Au used a NN for forecasting Japanese tourism outperforming all naive forecasts
+  - Input layer comprised 6 nodes: 
+    - Service Price
+    - Average Hotel Rate
+    - Foreign Exchange rate
+    - Population
+    - Marketing expenses
+    - Gross Domestic Expenditure
+    
+- *Forecast* package has **nnetar** function for neural networks autoregression
+ - A rendition of the avNNet in R by HYndman and Athanasopoulos
+ - Have to scale predictors and response in [0,1] or [-1,1]. Forecast does this for you.
+- Deseasonalize and De-trend to improve performance of neural networks
+  - Regression
+  - Exponential smoothing
+  - Exception of differencing
+- 4 main arguments of the nnetar function:
+   - repeats : controls the number of neural networks fit
+   - p (Non-seasonal lags) : Chosen based on best-fit AR(p) model
+   - P (seasonal lags) : Last observed value from the same season
+   - size : Number of nodes in hidden layer (nnetar allows only one hidden layer)
+   - Denoted by NNAR(p,P,size)
+- Uses the logit activation function to map inputs to hidden node values
+- From hidden node to output value, nnetar uses linear or logit function
+  - linout = TRUE, continuous range
+  - linout = FALSE, output is a probability
+  
+
+```{r}
+set.seed(90)
+FarePP.nnetar = nnetar(train.ts,repeats = 20,p = 11,P=1,size=7)
+summary(FarePP.nnetar$model[[1]])
+FarePP.nnetar.pred = forecast(FarePP.nnetar,h=nValidation)
+accuracy(FarePP.nnetar.pred,valid.ts)
+plot(train.ts,
+     lwd=1, 
+     ylab = "Fare Price",
+     xlab = "Time (in days)",
+     main = "Neural Network for Forecasting using forecast::nnetar")
+# lines(hwin.pred$fitted,lwd=2,col="blue")
+lines(FarePP.nnetar.pred$fitted,lwd=2,col="blue")
+lines(FarePP.nnetar.pred$mean,lwd=2,col="red",lty=2)
+lines(valid.ts)
+
+accuracy(FarePP.nnetar.pred,valid.ts)
+```
+
+
+
+
+
+
+
